@@ -38,7 +38,7 @@ def calc_Rs(Pr, Pb, Rs_i, API, gamma_g, T_F):
     """
     if Pr >= Pb:
         return Rs_i
-    rs = gamma_g * ((Pr / 18.2 + 1.4) ** 1.205) * (10 ** (0.0125 * API - 0.00091 * T_F))
+    rs = gamma_g * ((Pr / 18.2 + 1.4) * (10 ** (0.0125 * API - 0.00091 * T_F))) ** 1.205
     return max(float(rs), 0.0)
 
 def calc_Bo(Rs, gamma_g, gamma_o, T_F):
@@ -47,7 +47,7 @@ def calc_Bo(Rs, gamma_g, gamma_o, T_F):
     # Standing (1947)
     """
     F = Rs * (gamma_g / gamma_o) ** 0.5 + 1.25 * T_F
-    bo = 0.972 + 0.000147 * (F ** 1.175)
+    bo = 0.9759 + 0.000120 * (F ** 1.2)
     return float(np.clip(bo, 1.04, 1.81))
 
 def calc_Bg(Pr, T_F, z=0.9):
@@ -64,7 +64,7 @@ def calc_Bg(Pr, T_F, z=0.9):
 
 def calc_Rs_burbuja(Pb, API, gamma_g, T_F):
     """Rs en condiciones de burbuja (Pr = Pb)."""
-    return gamma_g * ((Pb / 18.2 + 1.4) ** 1.205) * (10 ** (0.0125 * API - 0.00091 * T_F))
+    return gamma_g * ((Pb / 18.2 + 1.4) * (10 ** (0.0125 * API - 0.00091 * T_F))) ** 1.205
 
 # =============================================================================
 # GENERACIÓN DE PARÁMETROS ALEATORIOS POR POZO
@@ -168,6 +168,7 @@ def simular_pozo(p):
     Gp   = 0.0
     Wp   = 0.0
     Winj = 0.0
+    cum_voidage_oil_rb = 0.0  # voidage acumulado de petróleo+gas libre [rb]
     t_eff = 0.0  # tiempo efectivo de producción (excluye shut-ins)
 
     rows = []
@@ -189,22 +190,23 @@ def simular_pozo(p):
         Bo = calc_Bo(Rs, gamma_g, gamma_o, T_F)
         Bg = calc_Bg(Pr, T_F)
 
-        # --- Caudal de gas ---
-        Qg_mscfd = (qo * Rs / 1000.0) if not shutin else 0.0   # [Mscf/d]
-
-        # --- Voidage en rb/d (sin doble-contar gas disuelto) ---
-        # Bo ya incluye el gas en solución. Solo se suma gas libre (liberado por debajo de Pb).
+        # --- Caudal de gas (disuelto + libre) ---
         if shutin:
+            Qg_mscfd = 0.0
             qo_voidage_rb = 0.0
+            free_gas_scfd = 0.0
         else:
             free_gas_scfd = max(qo * (Rs_bp - Rs), 0.0)  # gas libre [scf/d]
+            Qg_total_scfd = qo * Rs + free_gas_scfd       # gas total [scf/d]
+            Qg_mscfd = Qg_total_scfd / 1000.0             # [Mscf/d]
+            # Voidage: Bo ya incluye gas en solución, solo sumar gas libre
             qo_voidage_rb = qo * Bo + free_gas_scfd * Bg
 
         # --- Producción de agua simplificada (water cut creciente, parametrizado) ---
         if shutin:
             qw = 0.0
         else:
-            wc = min(wc_max, wc_rate * t)
+            wc = min(wc_max, wc_rate * t_eff)
             qw = qo * wc / max(1.0 - wc, 0.01)
 
         # --- Inyección de agua (empieza en día 180) ---
@@ -220,12 +222,13 @@ def simular_pozo(p):
             Gp   += Qg_mscfd * 1000 * dt   # convertir a scf
             Wp   += qw     * dt
             Winj += qwinj  * dt
+            cum_voidage_oil_rb += qo_voidage_rb * dt
 
         # --- Actualizar presión (MBE diferencial) ---
         if dt > 0:
             if shutin:
                 # Recuperación exponencial hacia presión de equilibrio depletada
-                Pr_eq = Pr_i - (Np * Bo + max(Gp - Np * Rs_bp, 0) * Bg - Winj * Bw) / (Vp_bbl * ct)
+                Pr_eq = Pr_i - (cum_voidage_oil_rb + Wp * Bw - Winj * Bw) / (Vp_bbl * ct)
                 Pr_eq = max(Pr_eq, Pb * 0.3)
                 Pr = Pr + (Pr_eq - Pr) * (1 - np.exp(-0.03 * dt))
             else:
