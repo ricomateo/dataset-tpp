@@ -48,7 +48,7 @@ def calc_Bo(Rs, gamma_g, gamma_o, T_F):
     """
     F = Rs * (gamma_g / gamma_o) ** 0.5 + 1.25 * T_F
     bo = 0.972 + 0.000147 * (F ** 1.175)
-    return float(np.clip(bo, 1.05, 1.80))
+    return float(np.clip(bo, 1.04, 1.81))
 
 def calc_Bg(Pr, T_F, z=0.9):
     """
@@ -85,6 +85,8 @@ def generar_params(pozo_id):
     Di      = np.random.uniform(0.0005, 0.003)
     b       = np.random.uniform(0.3, 1.0)
     VRR     = np.random.uniform(0.8, 1.2)
+    wc_rate = np.random.uniform(0.0005, 0.002)  # tasa de crecimiento de water cut [1/día]
+    wc_max  = np.random.uniform(0.4, 0.7)       # water cut máximo
     duracion_dias = int(np.random.uniform(3 * 365, 15 * 365))
 
     Rs_bp = float(calc_Rs_burbuja(Pb, API, gamma_g, T_F))
@@ -98,7 +100,7 @@ def generar_params(pozo_id):
         "pozo_id": pozo_id, "Pr_i": Pr_i, "Pb": Pb, "API": API,
         "gamma_g": gamma_g, "gamma_o": gamma_o, "T_F": T_F,
         "phi": phi, "k": k, "h": h, "A": A,
-        "qi": qi, "Di": Di, "b": b, "VRR": VRR,
+        "qi": qi, "Di": Di, "b": b, "VRR": VRR, "wc_rate": wc_rate, "wc_max": wc_max,
         "duracion_dias": duracion_dias, "Rs_bp": Rs_bp, "Bo_i": Bo_i,
         "Vp_bbl": Vp_bbl, "ct": ct,
     }
@@ -131,16 +133,28 @@ def simular_pozo(p):
     T_F     = p["T_F"];   Rs_bp = p["Rs_bp"]
     phi     = p["phi"];   k    = p["k"];  h = p["h"];  A = p["A"]
     qi      = p["qi"];    Di   = p["Di"]; b = p["b"];  VRR = p["VRR"]
+    wc_rate = p["wc_rate"]; wc_max = p["wc_max"]
     Vp_bbl  = p["Vp_bbl"];  ct = p["ct"]
     Bw      = 1.0   # rb/stb
 
     timesteps = build_timesteps(p["duracion_dias"])
 
-    # Definir 2 shut-ins aleatorios (inicio, duración)
+    # Definir 2 shut-ins aleatorios sin solapamiento (inicio, duración)
     shutin_upper = max(p["duracion_dias"] - 50, 201)
-    shutin_starts = sorted(np.random.randint(200, shutin_upper, size=2))
-    shutin_durations = np.random.randint(15, 46, size=2)
-    shutin_intervals = [(s, s + d) for s, d in zip(shutin_starts, shutin_durations)]
+    shutin_dur_1 = int(np.random.randint(15, 46))
+    shutin_start_1 = int(np.random.randint(200, shutin_upper))
+    shutin_end_1 = shutin_start_1 + shutin_dur_1
+    # Segundo shut-in empieza después de que termina el primero
+    shutin_start_2_lower = shutin_end_1 + 30  # al menos 30 días de separación
+    if shutin_start_2_lower < shutin_upper:
+        shutin_start_2 = int(np.random.randint(shutin_start_2_lower, shutin_upper))
+    else:
+        shutin_start_2 = shutin_end_1 + 30
+    shutin_dur_2 = int(np.random.randint(15, 46))
+    shutin_intervals = [
+        (shutin_start_1, shutin_end_1),
+        (shutin_start_2, shutin_start_2 + shutin_dur_2),
+    ]
 
     def en_shutin(t):
         for s, e in shutin_intervals:
@@ -154,6 +168,7 @@ def simular_pozo(p):
     Gp   = 0.0
     Wp   = 0.0
     Winj = 0.0
+    t_eff = 0.0  # tiempo efectivo de producción (excluye shut-ins)
 
     rows = []
 
@@ -162,11 +177,11 @@ def simular_pozo(p):
 
         shutin = en_shutin(t)
 
-        # --- Caudal de aceite (Arps hiperbólico) ---
+        # --- Caudal de aceite (Arps hiperbólico con tiempo efectivo) ---
         if shutin:
             qo = 0.0
         else:
-            qo = float(qi / (1 + b * Di * t) ** (1 / b))
+            qo = float(qi / (1 + b * Di * t_eff) ** (1 / b))
             qo = max(qo, 0.0)
 
         # --- PVT a presión actual ---
@@ -177,19 +192,27 @@ def simular_pozo(p):
         # --- Caudal de gas ---
         Qg_mscfd = (qo * Rs / 1000.0) if not shutin else 0.0   # [Mscf/d]
 
+        # --- Voidage en rb/d (sin doble-contar gas disuelto) ---
+        # Bo ya incluye el gas en solución. Solo se suma gas libre (liberado por debajo de Pb).
+        if shutin:
+            qo_voidage_rb = 0.0
+        else:
+            free_gas_scfd = max(qo * (Rs_bp - Rs), 0.0)  # gas libre [scf/d]
+            qo_voidage_rb = qo * Bo + free_gas_scfd * Bg
+
+        # --- Producción de agua simplificada (water cut creciente, parametrizado) ---
+        if shutin:
+            qw = 0.0
+        else:
+            wc = min(wc_max, wc_rate * t)
+            qw = qo * wc / max(1.0 - wc, 0.01)
+
         # --- Inyección de agua (empieza en día 180) ---
         if shutin or t < 180:
             qwinj = 0.0
         else:
-            voidage = qo * Bo + Qg_mscfd * 1000 * Bg   # [rb/d]
-            qwinj = max(VRR * voidage / Bw, 0.0)        # [bbl/d]
-
-        # --- Producción de agua simplificada (water cut creciente) ---
-        if shutin:
-            qw = 0.0
-        else:
-            wc = min(0.6, 0.001 * t / 365.0)
-            qw = qo * wc / max(1.0 - wc, 0.01)
+            total_voidage = qo_voidage_rb + qw * Bw  # [rb/d]
+            qwinj = max(VRR * total_voidage / Bw, 0.0)  # [bbl/d]
 
         # --- Actualizar acumuladas ---
         if dt > 0:
@@ -201,14 +224,20 @@ def simular_pozo(p):
         # --- Actualizar presión (MBE diferencial) ---
         if dt > 0:
             if shutin:
-                # Recuperación exponencial durante shut-in (solución analítica)
-                Pr = Pr_i - (Pr_i - Pr) * np.exp(-0.03 * dt)
+                # Recuperación exponencial hacia presión de equilibrio depletada
+                Pr_eq = Pr_i - (Np * Bo + max(Gp - Np * Rs_bp, 0) * Bg - Winj * Bw) / (Vp_bbl * ct)
+                Pr_eq = max(Pr_eq, Pb * 0.3)
+                Pr = Pr + (Pr_eq - Pr) * (1 - np.exp(-0.03 * dt))
             else:
-                voidage_rb = qo * Bo + Qg_mscfd * 1000 * Bg - qwinj * Bw
-                dPr = -(voidage_rb * dt) / (Vp_bbl * ct)
+                net_voidage_rb = qo_voidage_rb + qw * Bw - qwinj * Bw
+                dPr = -(net_voidage_rb * dt) / (Vp_bbl * ct)
                 Pr += dPr
 
         Pr = float(np.clip(Pr, Pb * 0.3, Pr_i))
+
+        # Acumular tiempo efectivo de producción
+        if not shutin and dt > 0:
+            t_eff += dt
 
         rows.append({
             "pozo_id":                   pid,
@@ -278,8 +307,8 @@ def validar(df, pr_iniciales):
                 errores.append(f"{pid}: {col} decrece")
 
     # Bo en rango físico
-    if not df["Bo_rb_stb"].between(1.05, 1.80).all():
-        errores.append("Bo fuera de rango [1.05, 1.80]")
+    if not df["Bo_rb_stb"].between(1.04, 1.81).all():
+        errores.append("Bo fuera de rango [1.04, 1.81]")
 
     # Rs no negativo
     if (df["Rs_scf_stb"] < 0).any():
