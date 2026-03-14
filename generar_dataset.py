@@ -57,6 +57,8 @@ def calc_Bg(Pr, T_F, z=0.9):
     # Craft & Hawkins (1959)
     """
     T_R = T_F + 459.67
+    if Pr <= 0:
+        return 1e-6
     bg = 0.00504 * z * T_R / Pr
     return max(float(bg), 1e-6)
 
@@ -85,8 +87,8 @@ def generar_params(pozo_id):
     VRR     = np.random.uniform(0.8, 1.2)
     duracion_dias = int(np.random.uniform(3 * 365, 15 * 365))
 
-    Rs_i = float(calc_Rs_burbuja(Pb, API, gamma_g, T_F))
-    Bo_i = calc_Bo(Rs_i, gamma_g, gamma_o, T_F)
+    Rs_bp = float(calc_Rs_burbuja(Pb, API, gamma_g, T_F))
+    Bo_i = calc_Bo(Rs_bp, gamma_g, gamma_o, T_F)
 
     # Volumen poroso en barriles: Vp [bbl] = A[m²] × h[m] × φ × 6.28981 (conv m³→bbl)
     Vp_bbl = A * h * phi * 6.28981
@@ -97,7 +99,7 @@ def generar_params(pozo_id):
         "gamma_g": gamma_g, "gamma_o": gamma_o, "T_F": T_F,
         "phi": phi, "k": k, "h": h, "A": A,
         "qi": qi, "Di": Di, "b": b, "VRR": VRR,
-        "duracion_dias": duracion_dias, "Rs_i": Rs_i, "Bo_i": Bo_i,
+        "duracion_dias": duracion_dias, "Rs_bp": Rs_bp, "Bo_i": Bo_i,
         "Vp_bbl": Vp_bbl, "ct": ct,
     }
 
@@ -126,7 +128,7 @@ def simular_pozo(p):
     pid     = p["pozo_id"]
     Pr_i    = p["Pr_i"];  Pb   = p["Pb"]
     API     = p["API"];   gamma_g = p["gamma_g"];  gamma_o = p["gamma_o"]
-    T_F     = p["T_F"];   Rs_i = p["Rs_i"]
+    T_F     = p["T_F"];   Rs_bp = p["Rs_bp"]
     phi     = p["phi"];   k    = p["k"];  h = p["h"];  A = p["A"]
     qi      = p["qi"];    Di   = p["Di"]; b = p["b"];  VRR = p["VRR"]
     Vp_bbl  = p["Vp_bbl"];  ct = p["ct"]
@@ -135,7 +137,8 @@ def simular_pozo(p):
     timesteps = build_timesteps(p["duracion_dias"])
 
     # Definir 2 shut-ins aleatorios (inicio, duración)
-    shutin_starts = sorted(np.random.randint(200, p["duracion_dias"] - 50, size=2))
+    shutin_upper = max(p["duracion_dias"] - 50, 201)
+    shutin_starts = sorted(np.random.randint(200, shutin_upper, size=2))
     shutin_durations = np.random.randint(15, 46, size=2)
     shutin_intervals = [(s, s + d) for s, d in zip(shutin_starts, shutin_durations)]
 
@@ -167,7 +170,7 @@ def simular_pozo(p):
             qo = max(qo, 0.0)
 
         # --- PVT a presión actual ---
-        Rs = calc_Rs(Pr, Pb, Rs_i, API, gamma_g, T_F)
+        Rs = calc_Rs(Pr, Pb, Rs_bp, API, gamma_g, T_F)
         Bo = calc_Bo(Rs, gamma_g, gamma_o, T_F)
         Bg = calc_Bg(Pr, T_F)
 
@@ -181,17 +184,25 @@ def simular_pozo(p):
             voidage = qo * Bo + Qg_mscfd * 1000 * Bg   # [rb/d]
             qwinj = max(VRR * voidage / Bw, 0.0)        # [bbl/d]
 
+        # --- Producción de agua simplificada (water cut creciente) ---
+        if shutin:
+            qw = 0.0
+        else:
+            wc = min(0.6, 0.001 * t / 365.0)
+            qw = qo * wc / max(1.0 - wc, 0.01)
+
         # --- Actualizar acumuladas ---
         if dt > 0:
             Np   += qo     * dt
             Gp   += Qg_mscfd * 1000 * dt   # convertir a scf
+            Wp   += qw     * dt
             Winj += qwinj  * dt
 
         # --- Actualizar presión (MBE diferencial) ---
         if dt > 0:
             if shutin:
-                # Recuperación exponencial durante shut-in
-                Pr += (Pr_i - Pr) * 0.03 * dt
+                # Recuperación exponencial durante shut-in (solución analítica)
+                Pr = Pr_i - (Pr_i - Pr) * np.exp(-0.03 * dt)
             else:
                 voidage_rb = qo * Bo + Qg_mscfd * 1000 * Bg - qwinj * Bw
                 dPr = -(voidage_rb * dt) / (Vp_bbl * ct)
@@ -267,8 +278,8 @@ def validar(df, pr_iniciales):
                 errores.append(f"{pid}: {col} decrece")
 
     # Bo en rango físico
-    if not df["Bo_rb_stb"].between(1.04, 1.81).all():
-        errores.append("Bo fuera de rango [1.04, 1.81]")
+    if not df["Bo_rb_stb"].between(1.05, 1.80).all():
+        errores.append("Bo fuera de rango [1.05, 1.80]")
 
     # Rs no negativo
     if (df["Rs_scf_stb"] < 0).any():
@@ -299,7 +310,6 @@ if __name__ == "__main__":
     print(f"Simulando {N_POZOS} pozos (~200.000 filas esperadas)...")
 
     dfs = []
-    params_log = []
     pr_iniciales = {}   # {pozo_id: Pr_inicial} guardado antes de cualquier ruido
 
     for i in range(1, N_POZOS + 1):
@@ -308,20 +318,6 @@ if __name__ == "__main__":
         pr_iniciales[pid] = p["Pr_i"]   # guardar ANTES del ruido
         df_pozo = simular_pozo(p)
         dfs.append(df_pozo)
-        params_log.append({
-            "pozo_id":           pid,
-            "Pr_inicial_psi":    round(p["Pr_i"], 1),
-            "Pb_psi":            round(p["Pb"], 1),
-            "Porosidad":         round(p["phi"], 3),
-            "Permeabilidad_mD":  round(p["k"], 1),
-            "Espesor_Neto_m":    round(p["h"], 1),
-            "Area_m2":           round(p["A"], 0),
-            "qi_bbl_d":          round(p["qi"], 1),
-            "Di_1_d":            round(p["Di"], 5),
-            "b_Arps":            round(p["b"], 3),
-            "VRR":               round(p["VRR"], 3),
-            "duracion_dias":     p["duracion_dias"],
-        })
         print(f"  {pid}: {len(df_pozo)} filas | Pr_i={p['Pr_i']:.0f} psi | Pb={p['Pb']:.0f} psi | {p['duracion_dias']} días")
 
     df = pd.concat(dfs, ignore_index=True)
